@@ -1,0 +1,39 @@
+# Login to Azure
+az login --use-device-code
+azd auth login --use-device-code
+
+# Create the environments
+
+# Before proceeding, create and edit the .env.dev file
+azd env new dev
+azd --environment dev env set --file .\config_files\.env.dev
+azd --environment dev env get-values
+azd --environment dev provision
+
+# Before proceeding, create and edit the .env.qa file
+azd env new qa
+azd --environment qa env set --file .\config_files\.env.qa
+azd --environment qa env get-values
+azd --environment qa provision
+
+# Before proceeding, create and edit the .env.prd file
+azd env new prd
+azd --environment prd env set --file .\config_files\.env.prd
+azd --environment prd env get-values
+azd --environment prd provision
+
+# If you need to wait for an admin to grant the permission for the search identity, run this after to re-run the provision script
+# You should wait a few minutes between granting the federation and doing the next steps. Entra ID might take some minutes to propagate.
+# Below we will edit the variable in the azd env directly, for future reference, you should also edit your env file.
+azd --environment dev env set CONFIGURE_SEARCH_PIPELINE true
+azd --environment dev hooks run postprovision
+
+# Delete the resources in Azure
+azd --environment dev down --purge
+azd --environment qa down --purge
+azd --environment prd down --purge
+
+# You can remove the environments from the local folder by either deleting the corresponding environment folder in the .azure folder or by running:
+azd env remove dev
+azd env remove qa
+azd env remove prd

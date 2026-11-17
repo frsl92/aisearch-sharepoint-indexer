@@ -1,6 +1,9 @@
 import itertools
 import json
+import subprocess
+import sys
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -146,7 +149,10 @@ def test_independent_auth_modes(
             assert billing["@odata.type"].endswith("ByKey" if vision_key else "ByIdentity")
             assert ("key" in billing) is vision_key
             assert billing["subdomainUrl"] == config.ai_services_endpoint
-            assert "identity" not in billing
+            if vision_key:
+                assert "identity" not in billing
+            else:
+                assert billing["identity"] is None
 
     calls = []
 
@@ -231,8 +237,12 @@ def test_custom_library_names_and_schedule(
     assert resources["indexers"]["schedule"] is None
 
 
+@pytest.mark.parametrize("search_auth", ["managed-identity", "azd"])
 def test_dry_run_is_offline_and_redacted(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    search_auth: str,
 ) -> None:
     secrets = {
         "SEARCH_ADMIN_KEY": "search-key-sentinel",
@@ -242,9 +252,15 @@ def test_dry_run_is_offline_and_redacted(
     }
     for name, value in secrets.items():
         monkeypatch.setenv(name, value)
-    with patch("provision.ManagedIdentityCredential") as identity, patch("provision.httpx.Client"):
-        assert main(["--dry-run"]) == 0
+    with (
+        patch("provision.ManagedIdentityCredential") as identity,
+        patch("provision.AzureDeveloperCliCredential") as azd,
+        patch("provision.httpx.Client") as client,
+    ):
+        assert main(["--dry-run", "--search-auth", search_auth]) == 0
     identity.assert_not_called()
+    azd.assert_not_called()
+    client.assert_not_called()
     output = capsys.readouterr().out
     assert "<redacted>" in output
     for secret in secrets.values():
@@ -290,6 +306,86 @@ def test_main_reports_error(settings: Settings, capsys: pytest.CaptureFixture[st
     with patch("provision.send_requests", side_effect=RuntimeError("HTTP 403: denied")):
         assert main([]) == 1
     assert "HTTP 403: denied" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("search_key", ["", "explicit-key"])
+def test_explicit_azd_auth(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch, search_key: str
+) -> None:
+    config = replace(settings, search_key=search_key)
+    monkeypatch.setenv("AZURE_TENANT_ID", "44444444-4444-4444-4444-444444444444")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if search_key:
+            assert request.headers["api-key"] == search_key
+            assert "Authorization" not in request.headers
+        else:
+            assert request.headers["Authorization"] == "Bearer azd-test-token"
+        return httpx.Response(201)
+
+    with (
+        patch("provision.AzureDeveloperCliCredential") as azd,
+        patch("provision.ManagedIdentityCredential") as identity,
+    ):
+        azd.return_value.__enter__.return_value.get_token.return_value = AccessToken(
+            "azd-test-token", 4_000_000_000
+        )
+        send_requests(
+            config,
+            build_resources(config),
+            search_auth="azd",
+            transport=httpx.MockTransport(handler),
+        )
+        identity.assert_not_called()
+        if search_key:
+            azd.assert_not_called()
+        else:
+            azd.assert_called_once_with(tenant_id="44444444-4444-4444-4444-444444444444")
+            azd.return_value.__enter__.return_value.get_token.assert_called_with(
+                "https://search.azure.com/.default"
+            )
+
+
+@pytest.mark.parametrize("code", [403, 400, 409])
+@pytest.mark.parametrize("recover", [True, False])
+def test_azd_auth_retry_is_bounded_and_only_for_forbidden(
+    settings: Settings, code: int, recover: bool
+) -> None:
+    config = replace(settings, search_key="retry-secret")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if not recover or len(calls) == 1:
+            return httpx.Response(code, text="Rejected retry-secret")
+        return httpx.Response(201)
+
+    with patch("provision.time.sleep") as sleep:
+        if recover and code == 403:
+            send_requests(
+                config,
+                build_resources(config),
+                search_auth="azd",
+                transport=httpx.MockTransport(handler),
+            )
+            assert len(calls) == len(build_resources(config)) + 1
+            sleep.assert_called_once_with(30)
+        else:
+            with pytest.raises(RuntimeError, match=f"HTTP {code}: Rejected <redacted>"):
+                send_requests(
+                    config,
+                    build_resources(config),
+                    search_auth="azd",
+                    transport=httpx.MockTransport(handler),
+                )
+            assert len(calls) == (11 if code == 403 else 1)
+            assert sleep.call_count == (10 if code == 403 else 0)
+
+
+def test_main_selects_azd_auth(settings: Settings) -> None:
+    with patch("provision.send_requests") as send:
+        assert main(["--search-auth", "azd"]) == 0
+    assert send.call_args.kwargs["search_auth"] == "azd"
 
 
 @pytest.mark.parametrize("deployment_type", list(DeploymentType))
@@ -346,6 +442,51 @@ def test_exact_resources_for_each_type(settings: Settings, deployment_type: Depl
         assert {item["name"] for item in selector["mappings"]} <= fields.keys()
 
 
+@pytest.mark.parametrize(
+    "deployment_type", [DeploymentType.IMAGE_EMBEDDINGS, DeploymentType.ALL_EMBEDDINGS]
+)
+def test_image_pipeline_wires_identity_vectors_and_index_projections(
+    settings: Settings, deployment_type: DeploymentType
+) -> None:
+    config = Settings.from_env(deployment_type)
+    resources = build_resources(config)
+    index, skillset, indexer = (resources[name] for name in ("indexes", "skillsets", "indexers"))
+    assert skillset["cognitiveServices"] == {
+        "@odata.type": "#Microsoft.Azure.Search.AIServicesByIdentity",
+        "subdomainUrl": config.ai_services_endpoint,
+        "identity": None,
+    }
+    skills = {skill["name"]: skill for skill in skillset["skills"]}
+    image = skills["embed-image"]
+    assert skills["ocr"]["context"] == image["context"] == "/document/normalized_images/*"
+    assert image["inputs"] == [{"name": "image", "source": image["context"]}]
+    assert skills["merge"]["inputs"][1]["source"] == image["context"] + "/text"
+    assert indexer["parameters"]["configuration"]["imageAction"] == "generateNormalizedImages"
+    assert indexer["targetIndexName"] == index["name"]
+    assert indexer["skillsetName"] == skillset["name"]
+
+    fields = {field["name"]: field for field in index["fields"]}
+    profiles = {profile["name"]: profile for profile in index["vectorSearch"]["profiles"]}
+    vectorizers = {item["name"]: item for item in index["vectorSearch"]["vectorizers"]}
+    profile = profiles[fields["image_vector"]["vectorSearchProfile"]]
+    vectorizer = vectorizers[profile["vectorizer"]]
+    assert fields["image_vector"]["dimensions"] == 1024
+    assert vectorizer["kind"] == "aiServicesVision"
+    assert vectorizer["aiServicesVisionParameters"] == {
+        "resourceUri": config.ai_services_endpoint,
+        "modelVersion": image["modelVersion"],
+    }
+    projections = skillset["indexProjections"]
+    assert projections["parameters"]["projectionMode"] == "skipIndexingParentDocuments"
+    selector = next(
+        item for item in projections["selectors"] if item["sourceContext"] == image["context"]
+    )
+    assert selector["targetIndexName"] == index["name"]
+    assert fields[selector["parentKeyFieldName"]]["filterable"]
+    mappings = {item["name"]: item["source"] for item in selector["mappings"]}
+    assert mappings["image_vector"] == image["context"] + "/" + image["outputs"][0]["targetName"]
+
+
 @pytest.mark.parametrize("deployment_type", list(DeploymentType))
 def test_only_selected_service_settings_are_required(
     settings: Settings, monkeypatch: pytest.MonkeyPatch, deployment_type: DeploymentType
@@ -380,6 +521,21 @@ def test_default_and_cli_override(
     resources = json.loads(capsys.readouterr().out)
     assert set(resources) == {"datasources", "indexes", "indexers"}
     assert resources["indexes"]["name"] == "test-rag-no-embedding"
+
+
+def test_provision_script_entry_point(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEPLOYMENT_TYPE", "no_embedding")
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, str(root / "scripts" / "provision.py"), "--dry-run"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    resources = json.loads(result.stdout)
+    assert resources["indexes"]["name"] == "test-rag-no-embedding"
+    assert set(resources) == {"datasources", "indexes", "indexers"}
 
 
 def test_type_names_are_stable_and_isolated(
