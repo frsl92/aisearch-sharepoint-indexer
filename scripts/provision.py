@@ -5,16 +5,17 @@ import json
 import os
 import re
 import sys
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlsplit
 from uuid import UUID
 
 import httpx
 from azure.core.exceptions import AzureError
-from azure.identity import ManagedIdentityCredential
+from azure.identity import AzureDeveloperCliCredential, ManagedIdentityCredential
 
 API_VERSION = "2026-08-01-preview"
 TEXT_MODEL = "text-embedding-3-large"
@@ -30,6 +31,13 @@ class DeploymentType(StrEnum):
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env(name, str(default)).lower()
+    if value not in ("true", "false"):
+        raise ValueError(f"{name} must be true or false.")
+    return value == "true"
 
 
 def required(name: str) -> str:
@@ -386,7 +394,11 @@ def build_resources(settings: Settings) -> dict[str, dict[str, Any]]:
                 else "#Microsoft.Azure.Search.AIServicesByIdentity"
             ),
             "subdomainUrl": settings.ai_services_endpoint,
-            **({"key": settings.ai_services_key} if settings.ai_services_key else {}),
+            **(
+                {"key": settings.ai_services_key}
+                if settings.ai_services_key
+                else {"identity": None}
+            ),
         },
         "indexProjections": {
             "selectors": [
@@ -501,12 +513,18 @@ def send_requests(
     *,
     status_only: bool = False,
     transport: httpx.BaseTransport | None = None,
+    search_auth: Literal["managed-identity", "azd"] = "managed-identity",
 ) -> None:
     with ExitStack() as stack:
         client = stack.enter_context(httpx.Client(timeout=60, transport=transport))
-        credential = (
-            stack.enter_context(ManagedIdentityCredential()) if not settings.search_key else None
-        )
+        credential: AzureDeveloperCliCredential | ManagedIdentityCredential | None = None
+        if not settings.search_key:
+            if search_auth == "azd":
+                credential = stack.enter_context(
+                    AzureDeveloperCliCredential(tenant_id=env("AZURE_TENANT_ID"))
+                )
+            else:
+                credential = stack.enter_context(ManagedIdentityCredential())
 
         def request(method: str, path: str, body: dict[str, Any] | None = None) -> httpx.Response:
             if credential is not None:
@@ -516,13 +534,18 @@ def send_requests(
                 }
             else:
                 headers = {"api-key": settings.search_key}
-            response = client.request(
-                method,
-                settings.search_endpoint + path,
-                params={"api-version": API_VERSION},
-                headers=headers,
-                json=body,
-            )
+            for attempt in range(11):
+                response = client.request(
+                    method,
+                    settings.search_endpoint + path,
+                    params={"api-version": API_VERSION},
+                    headers=headers,
+                    json=body,
+                )
+                if response.status_code != 403 or search_auth != "azd" or attempt == 10:
+                    break
+                print("Search authorization not ready (HTTP 403); retrying in 30 seconds.")
+                time.sleep(30)
             if not response.is_success:
                 raise RuntimeError(
                     f"{method} {path}: HTTP {response.status_code}: "
@@ -550,6 +573,12 @@ def main(argv: list[str] | None = None) -> int:
         choices=list(DeploymentType),
         help="Override DEPLOYMENT_TYPE (default: no_embedding).",
     )
+    parser.add_argument(
+        "--search-auth",
+        choices=("managed-identity", "azd"),
+        default="managed-identity",
+        help="Search token credential when no admin key is set (default: managed-identity).",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run", action="store_true", help="Print redacted JSON without Azure calls."
@@ -563,7 +592,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print(settings.hide_secrets(json.dumps(resources, indent=2)))
         else:
-            send_requests(settings, resources, status_only=args.status)
+            send_requests(
+                settings, resources, status_only=args.status, search_auth=args.search_auth
+            )
             if not args.status:
                 print("New indexers start automatically. Use --status to check indexing results.")
         return 0

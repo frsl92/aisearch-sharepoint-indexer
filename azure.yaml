@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+name: aisearch-sharepoint-indexer
+infra:
+  provider: bicep
+  # Layer hooks run after azd resolves the deployment subscription.
+  layers:
+    - name: infrastructure
+      path: infra
+      hooks:
+        preprovision:
+          windows:
+            shell: pwsh
+            run: uv run python ..\scripts\preprovision.py
+            interactive: false
+          posix:
+            shell: sh
+            run: uv run python ../scripts/preprovision.py
+            interactive: false
+hooks:
+  postprovision:
+    windows:
+      shell: pwsh
+      run: uv run python .\scripts\postprovision.py
+      interactive: false
+    posix:
+      shell: sh
+      run: uv run python ./scripts/postprovision.py
+      interactive: false

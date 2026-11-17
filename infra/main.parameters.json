@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": { "value": "${AZURE_ENV_NAME}" },
+    "location": { "value": "${AZURE_LOCATION}" },
+    "resourceGroupName": { "value": "${AZURE_RESOURCE_GROUP=}" },
+    "principalId": { "value": "${AZURE_PRINCIPAL_ID}" },
+    "principalType": { "value": "${AZURE_PRINCIPAL_TYPE=User}" },
+    "searchSku": { "value": "${SEARCH_SKU=basic}" },
+    "searchReplicaCount": { "value": "${SEARCH_REPLICA_COUNT=1}" },
+    "searchPartitionCount": { "value": "${SEARCH_PARTITION_COUNT=1}" },
+    "searchSemanticSearch": { "value": "${SEARCH_SEMANTIC_SEARCH=standard}" },
+    "foundryLocation": { "value": "${FOUNDRY_LOCATION=}" },
+    "embeddingDeploymentName": { "value": "${AZURE_OPENAI_DEPLOYMENT=text-embedding-3-large}" },
+    "embeddingModelVersion": { "value": "${EMBEDDING_MODEL_VERSION=1}" },
+    "embeddingSku": { "value": "${EMBEDDING_SKU=Standard}" },
+    "embeddingCapacity": { "value": "${EMBEDDING_CAPACITY=1}" },
+    "deploymentType": { "value": "${DEPLOYMENT_TYPE=text_embeddings}" }
+  }
+}
